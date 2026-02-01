@@ -1,11 +1,27 @@
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
-app.use(cors());
-app.options(/.*/, cors());
-app.use(express.json());
+
+// -------------------- MIDDLEWARE --------------------
+app.use(
+  cors({
+    origin: true, // laat alle origins toe (ok voor demo); later beperken tot stempeler.com
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
+app.use(express.json({ limit: "256kb" }));
+
+// -------------------- CONFIG --------------------
+const STAMP_CAP = 10; // max 10 stempels
+const EURO_PER_STAMP = 10; // 10€ = 1 stempel
+const MAX_AMOUNT_CENTS = 50000; // demo: max 500€
+const RATE_MAX_PER_MIN = 20;
 
 // -------------------- STORES --------------------
 const STORES = [
@@ -14,7 +30,7 @@ const STORES = [
 ];
 
 // -------------------- USERS (PER STORE) --------------------
-// username is alleen uniek binnen store
+// username is alleen uniek binnen dezelfde store
 const USERS = [
   // Shop A
   { id: "u1", storeId: "s1", username: "staff1", password: "1234", role: "staff" },
@@ -25,16 +41,71 @@ const USERS = [
   { id: "u4", storeId: "s2", username: "manager1", password: "1234", role: "manager" },
 ];
 
-// -------------------- SESSIONS --------------------
-const TOKENS = new Map(); // token -> session
+// -------------------- IN-MEMORY STATE (DEMO) --------------------
+// token -> session
+const TOKENS = new Map();
+
+// storeId -> Map(walletId -> { stamps })
+const ledgerByStore = new Map();
+
+// storeId -> audit entries array
+const auditByStore = new Map();
+
+// `${storeId}:${userId}` -> { startMs, count }
+const rateByKey = new Map();
+
+// -------------------- HELPERS --------------------
 function createToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getStore(storeId) {
+  return STORES.find((s) => s.id === storeId) || null;
+}
+
+function getStoreLedger(storeId) {
+  if (!ledgerByStore.has(storeId)) ledgerByStore.set(storeId, new Map());
+  return ledgerByStore.get(storeId);
+}
+
+function getStoreAudit(storeId) {
+  if (!auditByStore.has(storeId)) auditByStore.set(storeId, []);
+  return auditByStore.get(storeId);
+}
+
+function calcStampsFromAmountCents(amountCents) {
+  const euros = amountCents / 100;
+  return Math.floor(euros / EURO_PER_STAMP);
+}
+
+function allowRate(storeId, userId) {
+  const key = `${storeId}:${userId}`;
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+
+  let bucket = rateByKey.get(key);
+  if (!bucket || now - bucket.startMs > windowMs) {
+    bucket = { startMs: now, count: 0 };
+  }
+
+  bucket.count += 1;
+  rateByKey.set(key, bucket);
+
+  return bucket.count <= RATE_MAX_PER_MIN;
+}
+
+// -------------------- AUTH MIDDLEWARE --------------------
 function auth(req, res, next) {
   const header = req.headers["authorization"] || "";
   const [kind, token] = header.split(" ");
-  if (kind !== "Bearer" || !token) return res.status(401).json({ error: "Missing Bearer token" });
+
+  if (kind !== "Bearer" || !token) {
+    return res.status(401).json({ error: "Missing Bearer token" });
+  }
 
   const session = TOKENS.get(token);
   if (!session) return res.status(401).json({ error: "Invalid token" });
@@ -45,60 +116,31 @@ function auth(req, res, next) {
 }
 
 function requireManager(req, res, next) {
-  if (req.user.role !== "manager") return res.status(403).json({ error: "Manager only" });
+  if (req.user.role !== "manager") {
+    return res.status(403).json({ error: "Manager only" });
+  }
   next();
 }
 
-// -------------------- LEDGER + AUDIT (PER STORE) --------------------
-const ledgerByStore = new Map(); // storeId -> Map(walletId -> { stamps })
-const auditByStore = new Map();  // storeId -> array
-
-function getStoreLedger(storeId) {
-  if (!ledgerByStore.has(storeId)) ledgerByStore.set(storeId, new Map());
-  return ledgerByStore.get(storeId);
-}
-function getStoreAudit(storeId) {
-  if (!auditByStore.has(storeId)) auditByStore.set(storeId, []);
-  return auditByStore.get(storeId);
-}
-
-function calcStampsFromAmountCents(amountCents) {
-  const euros = amountCents / 100;
-  return Math.floor(euros / 10); // 10€ = 1 stempel
-}
-
-// -------------------- RATE LIMIT (BASIC) --------------------
-const RATE_MAX_PER_MIN = 20;
-const rate = new Map(); // `${storeId}:${userId}` -> { startMs, count }
-
-function allowRate(storeId, userId) {
-  const key = `${storeId}:${userId}`;
-  const now = Date.now();
-  const minute = 60 * 1000;
-
-  let w = rate.get(key);
-  if (!w || now - w.startMs > minute) w = { startMs: now, count: 0 };
-  w.count += 1;
-  rate.set(key, w);
-
-  return w.count <= RATE_MAX_PER_MIN;
-}
-
 // -------------------- ROUTES --------------------
-app.get("/", (req, res) => res.send("Backend OK ✅"));
+app.get("/", (req, res) => {
+  res.send("Backend OK ✅");
+});
 
+// --- Stores list (public) ---
 app.get("/stores", (req, res) => {
   res.json({ stores: STORES });
 });
 
-// Store-first login
+// --- Store-first login (public) ---
 app.post("/auth/login", (req, res) => {
   const { storeId, username, password } = req.body || {};
+
   if (!storeId || !username || !password) {
     return res.status(400).json({ error: "storeId/username/password required" });
   }
 
-  const store = STORES.find((s) => s.id === storeId);
+  const store = getStore(storeId);
   if (!store) return res.status(400).json({ error: "Unknown storeId" });
 
   const user = USERS.find(
@@ -114,6 +156,7 @@ app.post("/auth/login", (req, res) => {
     role: user.role,
     createdAt: Date.now(),
   };
+
   TOKENS.set(token, session);
 
   res.json({
@@ -123,78 +166,112 @@ app.post("/auth/login", (req, res) => {
   });
 });
 
+// --- Logout (protected) ---
 app.post("/auth/logout", auth, (req, res) => {
   TOKENS.delete(req.token);
   res.json({ ok: true });
 });
 
+// --- Me (protected) ---
 app.get("/me", auth, (req, res) => {
-  const store = STORES.find((s) => s.id === req.user.storeId);
+  const store = getStore(req.user.storeId);
   res.json({ user: req.user, store });
 });
 
-// Public ledger (customer) — vereist storeId
+// --- Public ledger for customer (requires storeId query) ---
 app.get("/ledger/:walletId", (req, res) => {
   const { walletId } = req.params;
   const storeId = req.query.storeId;
+
+  if (!walletId || typeof walletId !== "string") {
+    return res.status(400).json({ error: "walletId required" });
+  }
   if (!storeId || typeof storeId !== "string") {
     return res.status(400).json({ error: "storeId query required" });
   }
 
+  const store = getStore(storeId);
+  if (!store) return res.status(400).json({ error: "Unknown storeId" });
+
   const storeLedger = getStoreLedger(storeId);
   const entry = storeLedger.get(walletId) || { stamps: 0 };
 
-  res.json({ walletId, storeId, stamps: entry.stamps, stampCap: 10 });
+  res.json({
+    walletId,
+    storeId,
+    stamps: entry.stamps,
+    stampCap: STAMP_CAP,
+  });
 });
 
-// Earn (protected) — storeId komt uit token (niet uit body!)
+// --- Earn stamps (protected) ---
+// storeId komt uit token (dus staff kan niet cross-store)
 app.post("/earn", auth, (req, res) => {
   const { walletId, amountCents } = req.body || {};
-  if (!walletId || typeof walletId !== "string") return res.status(400).json({ error: "walletId missing" });
-  if (typeof amountCents !== "number") return res.status(400).json({ error: "amountCents must be number" });
+  if (!walletId || typeof walletId !== "string") {
+    return res.status(400).json({ error: "walletId missing" });
+  }
+  if (typeof amountCents !== "number" || Number.isNaN(amountCents)) {
+    return res.status(400).json({ error: "amountCents must be a number" });
+  }
 
   const storeId = req.user.storeId;
 
-  // basic fraud/rate
+  // Basic validation / fraud demo
   if (amountCents <= 0) return res.status(400).json({ error: "amount must be > 0" });
-  if (amountCents > 50000) return res.status(400).json({ error: "amount too high (demo)" });
-  if (!allowRate(storeId, req.user.userId)) return res.status(429).json({ error: "Rate limit exceeded" });
+  if (amountCents > MAX_AMOUNT_CENTS) return res.status(400).json({ error: "amount too high (demo)" });
+
+  // Rate limit per staff per store
+  if (!allowRate(storeId, req.user.userId)) {
+    return res.status(429).json({ error: "Rate limit exceeded" });
+  }
 
   const stampsAdded = calcStampsFromAmountCents(amountCents);
   const storeLedger = getStoreLedger(storeId);
 
   const current = storeLedger.get(walletId) || { stamps: 0 };
-  const next = Math.min(10, Math.max(0, current.stamps + stampsAdded));
+  const next = Math.min(STAMP_CAP, Math.max(0, current.stamps + stampsAdded));
   storeLedger.set(walletId, { stamps: next });
 
   const entry = {
     id: crypto.randomBytes(8).toString("hex"),
-    ts: new Date().toISOString(),
+    ts: nowIso(),
+    type: "EARN",
     storeId,
     walletId,
     amountCents,
     stampsAdded,
     stampsAfter: next,
-    staff: { userId: req.user.userId, username: req.user.username, role: req.user.role },
+    staff: {
+      userId: req.user.userId,
+      username: req.user.username,
+      role: req.user.role,
+    },
   };
 
   const storeAudit = getStoreAudit(storeId);
   storeAudit.unshift(entry);
   if (storeAudit.length > 200) storeAudit.length = 200;
 
-  res.json({ ok: true, ...entry, stampCap: 10 });
+  res.json({
+    ok: true,
+    ...entry,
+    stampCap: STAMP_CAP,
+  });
 });
 
-// Audit (manager only) — alleen eigen store
+// --- Audit (manager only, own store only) ---
 app.get("/audit", auth, requireManager, (req, res) => {
   const storeId = req.user.storeId;
   res.json({ storeId, items: getStoreAudit(storeId) });
 });
 
-// Reset (manager only) — alleen eigen store
+// --- Reset wallet (manager only, own store only) ---
 app.post("/wallet/reset", auth, requireManager, (req, res) => {
   const { walletId } = req.body || {};
-  if (!walletId || typeof walletId !== "string") return res.status(400).json({ error: "walletId missing" });
+  if (!walletId || typeof walletId !== "string") {
+    return res.status(400).json({ error: "walletId missing" });
+  }
 
   const storeId = req.user.storeId;
   const storeLedger = getStoreLedger(storeId);
@@ -202,19 +279,22 @@ app.post("/wallet/reset", auth, requireManager, (req, res) => {
 
   const entry = {
     id: crypto.randomBytes(8).toString("hex"),
-    ts: new Date().toISOString(),
+    ts: nowIso(),
     type: "RESET",
     storeId,
     walletId,
-    by: { userId: req.user.userId, username: req.user.username },
+    by: { userId: req.user.userId, username: req.user.username, role: req.user.role },
   };
+
   const storeAudit = getStoreAudit(storeId);
   storeAudit.unshift(entry);
+  if (storeAudit.length > 200) storeAudit.length = 200;
 
-  res.json({ ok: true, storeId, walletId, stamps: 0 });
+  res.json({ ok: true, storeId, walletId, stamps: 0, stampCap: STAMP_CAP });
 });
 
-app.listen(3000, () => console.log("Backend running on http://localhost:3000"));
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log("Running on", port));
+// -------------------- START (Cloud Run compatible) --------------------
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log("Backend running on port", PORT);
+});
